@@ -9,3 +9,5 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/chroma/
+# Office 暫存鎖定檔：不進版控
+~$*

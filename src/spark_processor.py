@@ -4,10 +4,12 @@
 做「實體萃取 → 關係建構 → 結構化儲存」，供後續精準檢索使用。
 
 核心約束（開發者明確要求）：
-    1. 【不要使用向量化】全模組絕不計算 Embedding、不做向量相似度檢索。
-    2. ChromaDB 僅作為「結構化標籤 / 文字索引儲存器」：
-       只用 ``add / upsert / get``，檢索只走 ``where``（Metadata 精準比對）
-       與 ``where_document``（關鍵字 $contains），絕不呼叫 ``query()``。
+    1. 【RRF 混合檢索升級】ChromaDB 已從純文字標籤庫升級為語意儲存庫：
+       每份文件（原文＋繁體轉換）皆帶密集向量（Dense Vector），
+       仍保留 Metadata / where_document 精準檢索能力（無向量依賴）。
+    2. 向量一律來自本機 Ollama（bge-m3，1024 維），經 HTTP 批次編碼後，
+       以顯式 embeddings 帶入 upsert（不載入 torch，不依賴內建 EF）；
+       唯 --no-vector 模式回到純文字 upsert（降級能力保留）。
     3. SQLite3 存放 3 張核心資料表，為關聯圖譜的權威來源（source of truth）。
 
 儲存端雙寫索引（Dual-Indexed）架構：
@@ -76,6 +78,14 @@ class SparkConfig:
         max_relations_per_chunk: 每個 Chunk 最多保留幾條關係。
         dual_script: 是否啟用簡繁雙寫（預設 True）。關閉則回到單字形寫入
             （行為與舊版完全一致）；若 opencc 未安裝也會自動降級為單寫。
+        no_vector: 是否關閉密集向量（預設 False）。True 時不連線 Ollama、
+            不寫入 embeddings（純文字模式，行為與向量升級前一致）。
+        embedding_model: 本機 Ollama 向量模型（預設 "bge-m3:latest"，1024 維；
+            需先在 Ollama 內 pull 好，服務位址見 embedding_base_url）。
+        embedding_base_url: Ollama 服務位址（預設 "http://127.0.0.1:11434"）。
+            初始化時會確認連線；連不上則 WARNING 並降級純文字模式。
+        embedding_batch_size: 送 Ollama 編碼的每批文本數（預設 32，與 loader
+            批次對齊，控制單次 HTTP 請求大小）。
     """
 
     model: str = "muse-spark-1.3"
@@ -90,6 +100,10 @@ class SparkConfig:
     max_entities_per_chunk: int = 20
     max_relations_per_chunk: int = 30
     dual_script: bool = True
+    no_vector: bool = False
+    embedding_model: str = "bge-m3:latest"
+    embedding_base_url: str = "http://127.0.0.1:11434"
+    embedding_batch_size: int = 32
 
     def __post_init__(self) -> None:
         """以環境變數補齊未填的連線參數（環境變數優先級低於顯式傳參）。"""
@@ -564,6 +578,11 @@ class SparkProcessor:
         self._collection: Any = None
         self._chroma_failed = False  # 失敗後不再重試，避免每次寫入都卡住
 
+        # ── 密集向量（Ollama bge-m3；no_vector 時跳過連線檢查）──
+        self._ollama_ok: bool = False  # Ollama 服務是否可用（寫入層據此決定帶不帶向量）
+        self.embedding_dim: int = -1  # 向量維度（bge-m3 為 1024；-1 表無向量模式）
+        self._check_ollama()  # 規格要求：初始化期即確認連線，異常自動降級
+
     def _ensure_script_columns(self) -> None:
         """舊庫遷移：若 entities / relations 缺 script 欄，以 ALTER 補上。
 
@@ -595,6 +614,101 @@ class SparkProcessor:
             self._conn.close()
         except sqlite3.Error:
             pass
+
+    # ══════════════════════════════════════════
+    # 向量初始化與批次編碼（Ollama bge-m3，不載入 torch）
+    # ══════════════════════════════════════════
+
+    def _check_ollama(self) -> None:
+        """初始化期確認 Ollama API 服務可正常連線（規格要求）。
+
+        流程：no_vector 直接跳過 → GET /api/tags 探測服務存活 →
+        檢查 embedding_model 是否已下載（缺模型只 WARNING，編碼失敗時
+        再逐批降級，方便用戶稍後 `ollama pull` 後重跑免重啟程式）。
+        全程不載入 torch / sentence-transformers，顯存零佔用。
+        """
+        if self.config.no_vector:
+            logger.info("向量已關閉（--no-vector），採用純文字模式。")
+            return
+        base = (self.config.embedding_base_url or "").rstrip("/")
+        try:
+            import requests  # 延遲匯入；本模組唯一新增的外部依賴即它
+        except ImportError as e:
+            logger.warning("未安裝 requests，無法連線 Ollama，降級為純文字模式（%s）", e)
+            return
+        try:
+            resp = requests.get(f"{base}/api/tags", timeout=10)
+            resp.raise_for_status()
+            self._ollama_ok = True
+            names = [m.get("name", "") for m in resp.json().get("models", [])]
+            if self.config.embedding_model not in names:
+                logger.warning("Ollama 連線正常，但模型 %r 尚未下載（現有：%s）；"
+                               "請執行 ollama pull %s，編碼失敗的批次會自動降級純文字寫入",
+                               self.config.embedding_model, names, self.config.embedding_model)
+            else:
+                logger.info("Ollama 就緒：%s（%s）。",
+                            self.config.embedding_model, base)
+        except Exception as e:  # noqa: BLE001 — 服務未啟動/斷線皆降級，管線不中斷
+            logger.warning("Ollama 連線失敗（%s），降級為純文字模式", e)
+            self._ollama_ok = False
+
+    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """單次 HTTP 編碼一批文本（POST /api/embed，一次多文本）。
+
+        Args:
+            texts: 非空文本串列（呼叫端保證去重與非空）。
+
+        Returns:
+            與輸入一一對應的浮點向量串列；數量不符或異常時拋出例外，
+            由 _encode_texts 捕捉並降級（整批改純文字 upsert）。
+        """
+        import requests
+
+        base = (self.config.embedding_base_url or "").rstrip("/")
+        resp = requests.post(
+            f"{base}/api/embed",
+            json={"model": self.config.embedding_model, "input": texts},
+            timeout=120,  # 本機 32×600 字編碼僅需數秒，120 秒綽綽有餘
+        )
+        resp.raise_for_status()
+        vectors = resp.json().get("embeddings", [])
+        if len(vectors) != len(texts):
+            raise RuntimeError(f"Ollama 回傳向量數 {len(vectors)} 與輸入 {len(texts)} 不一致")
+        return [[float(x) for x in v] for v in vectors]
+
+    def _encode_texts(self, texts: List[str]) -> List[List[float]]:
+        """批次向量化：去重後按 embedding_batch_size 分批送 Ollama，映射回原順序。
+
+        呼叫規格：每批最多 32 個文本（與 loader 批次對齊），POST /api/embed；
+        空輸入、no_vector、Ollama 不可用回傳空串列（寫入層改純文字 upsert）。
+        任一批次失敗即整批降級（WARNING 一筆），不讓單批錯誤拖垮整條管線。
+
+        Args:
+            texts: 待編碼文本串列（允許重複與空字串，內部處理）。
+
+        Returns:
+            與輸入一一對應的浮點向量串列（list of list，可直接給 Chroma）；
+            降級時回傳空串列。
+        """
+        cleaned = [t if t else " " for t in texts]  # 空串轉單空白，避免編碼器報錯
+        if not cleaned or self.config.no_vector or not self._ollama_ok:
+            return []
+        # 【去重】同批原文/轉換文件常有重複字串，去重後分批送，省請求次數
+        uniq: List[str] = list(dict.fromkeys(cleaned))
+        size = max(1, int(self.config.embedding_batch_size))
+        table: Dict[str, List[float]] = {}
+        try:
+            for i in range(0, len(uniq), size):
+                piece = uniq[i : i + size]
+                for text, vector in zip(piece, self._embed_batch(piece)):
+                    table[text] = vector
+                    # 首個成功向量即確定維度（bge-m3 為 1024）
+                    if self.embedding_dim < 0:
+                        self.embedding_dim = len(vector)
+        except Exception as e:  # noqa: BLE001 — 任一批失敗整批降級純文字
+            logger.warning("Ollama 編碼失敗（%s），本批改純文字寫入", e)
+            return []
+        return [table[t] for t in cleaned]
 
     # ══════════════════════════════════════════
     # 5.1 Muse Spark 1.3 API 呼叫（api 模式專用）
@@ -925,6 +1039,27 @@ class SparkProcessor:
             self._chroma_failed = True
             return False
 
+    def _recreate_chroma(self) -> bool:
+        """刪除並重建 Chroma 集合（僅向量維度不符時呼叫）。
+
+        背景：集合的向量維度在首次寫入即被釘住（如早期純文字時代的預設 384 維），
+        之後 upsert 不同維度會直接報錯，無法原地升級，只能重建。
+        注意：重建會清空集合內所有文件，重建後必須重跑管線回填全部批次
+        （局部重建會遺失該批以外的文件，完整重跑則冪等回填）。
+        """
+        try:
+            if self._chroma_client is None:
+                return False
+            self._chroma_client.delete_collection(self.config.chroma_collection)
+            self._collection = None  # 強制 _ensure_chroma 重建並重取
+            ok = self._ensure_chroma()
+            if ok:
+                logger.warning("Chroma 集合已重建（維度已更新），請重跑完整管線回填全部文件")
+            return ok
+        except Exception as e:  # noqa: BLE001 — 重建失敗就保留舊集合，SQLite 成果不受影響
+            logger.warning("Chroma 集合重建失敗（%s）", e)
+            return False
+
     def _store_chroma_batch(
         self, batch_chunks: List[Chunk], enriched: List[EnrichedChunk]
     ) -> None:
@@ -934,6 +1069,10 @@ class SparkProcessor:
         Metadata 雙字形標註：entities 欄在原文列存原文名、轉換列存轉換名，
         另有 script（'orig'/'conv'）與 base_id（回指原 chunk）供去重與稽核。
         Metadata 值限 str/int/float/bool，實體串以 "|" 連接成單一字串。
+
+        RRF 升級：模型就緒時，提取本批所有唯一 text，一次批次向量化後，
+        將浮點數向量矩陣帶入 ``embeddings=`` 參數，使 Chroma 正式成為
+        具備真實密集向量的語意儲存庫；模型缺席時退回純文字 upsert。
         """
         if not self._ensure_chroma():
             return  # 降級：SQLite 已寫入成功，Chroma 跳過即可
@@ -977,9 +1116,30 @@ class SparkProcessor:
                 break  # _dual_variants 最多一個 conv，取首個即離開
         if not ids:
             return
+        embeddings = self._encode_texts(docs)  # 就緒時回傳對齊向量，降級時回空
+        with_vectors = bool(embeddings) and len(embeddings) == len(docs)
         try:
-            self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
+            if with_vectors:
+                # 【向量雙寫】Ollama bge-m3 的 1024 維浮點矩陣帶入 embeddings 參數，
+                # ChromaDB 正式成為向量語意儲存庫（供後續語意查詢用顯式向量檢索）
+                self._collection.upsert(
+                    ids=ids, documents=docs, metadatas=metas, embeddings=embeddings
+                )
+            else:
+                # 【純文字降級】--no-vector / Ollama 不可用 / 本批編碼失敗時，不帶 embeddings
+                self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
         except Exception as e:  # noqa: BLE001 — Chroma 寫入失敗不應拖垮整批 SQLite 成果
+            # 【維度自癒】舊集合被預設 384 維釘住時，帶 1024 維必報錯；
+            # 重建集合後重試一次（僅帶向量寫入才需要，純文字路徑不受影響）
+            if with_vectors and "dimension" in str(e).lower() and self._recreate_chroma():
+                try:
+                    self._collection.upsert(
+                        ids=ids, documents=docs, metadatas=metas, embeddings=embeddings
+                    )
+                    return
+                except Exception as e2:  # noqa: BLE001 — 重試仍敗就認賠，SQLite 成果保留
+                    logger.warning("ChromaDB 重建後寫入仍失敗（%s），本批僅保留 SQLite 結果", e2)
+                    return
             logger.warning("ChromaDB 寫入失敗（%s），本批僅保留 SQLite 結果", e)
 
     # ══════════════════════════════════════════
@@ -1091,16 +1251,73 @@ class SparkProcessor:
         )
         return [dict(row) for row in cur.fetchall()]
 
-    def stats(self) -> Dict[str, int]:
-        """回傳三表筆數與 Chroma 筆數（Chroma 不可用時該欄為 -1）。
+    def embed_query(self, text: str) -> List[float]:
+        """查詢向量化：單句轉 1024 維向量（Ollama bge-m3，供 RRF 混合檢索用）。
+
+        失敗（Ollama 不可用 / 空輸入）回傳空串列，不拋錯，
+        呼叫端（agent_router）據此退回純稀疏檢索。
+        """
+        vectors = self._encode_texts([text] if (text or "").strip() else [])
+        return vectors[0] if vectors else []
+
+    def semantic_search(
+        self, query: str, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """向量語意檢索：query 轉向量 → collection.query 顯式向量查詢。
+
+        以 base_id 去重（轉換列 -trad 歸戶原文，原文列優先），回傳格式與
+        search_by_keyword 一致並多帶 distance（餘弦距離，越小越相關）。
+        無向量 / 維度不符 / 查詢異常一律回傳空串列（RRF 退回純稀疏）。
+        """
+        if not self._ensure_chroma():
+            return []
+        query_vector = self.embed_query(query)
+        if not query_vector:
+            return []  # 無查詢向量就沒有語意可言，直接交棒稀疏檢索
+        try:
+            res = self._collection.query(
+                query_embeddings=[query_vector], n_results=limit,
+                include=["documents", "metadatas", "distances"],
+            )
+            merged: Dict[str, Dict[str, Any]] = {}
+            ids = (res.get("ids") or [[]])[0]
+            docs = (res.get("documents") or [[]])[0]
+            metas = (res.get("metadatas") or [[]])[0]
+            dists = (res.get("distances") or [[]])[0]
+            for i, cid in enumerate(ids):
+                meta = metas[i] if i < len(metas) else {}
+                base = str((meta or {}).get("base_id", "") or cid)
+                row = {
+                    "chunk_id": base,
+                    "title": str((meta or {}).get("title", "")),
+                    "text": docs[i] if i < len(docs) else "",
+                    "source": "vector",
+                    "distance": float(dists[i]) if i < len(dists) else 9.9,
+                }
+                # 【去重】同 chunk 優先保留原文列（script='orig'）
+                if base not in merged or (meta or {}).get("script") == "orig":
+                    merged[base] = row
+            return list(merged.values())[:limit]
+        except Exception as e:  # noqa: BLE001 — 維度不符等異常皆退回稀疏，不中斷問答
+            logger.warning("向量語意檢索失敗（%s），退回純稀疏檢索", e)
+            return []
+
+    def stats(self) -> Dict[str, Any]:
+        """回傳三表筆數、Chroma 筆數與向量狀態（Chroma 不可用時該欄為 -1）。
 
         雙寫啟用時 entities / relations / chroma_docs 約為單寫的 2 倍，
         屬正常現象（同一知識的兩種字形各一列）。
+        vector_backend 為 "ollama:<模型名>" 或 "off"（--no-vector 或連線失敗時），
+        vector_dim 為向量維度（bge-m3 為 1024；無向量模式為 -1）。
         """
-        out = {}
+        out: Dict[str, Any] = {}
         for table in ("chunks", "entities", "relations"):
             cur = self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}")
             out[table] = int(cur.fetchone()["n"])
+        out["vector_backend"] = (
+            f"ollama:{self.config.embedding_model}" if self._ollama_ok else "off"
+        )
+        out["vector_dim"] = self.embedding_dim
         if self._ensure_chroma():
             try:
                 out["chroma_docs"] = int(self._collection.count())
@@ -1175,13 +1392,20 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--mode", default="rule", choices=["rule", "api"], help="抽取模式")
     parser.add_argument("--progress", action="store_true", help="顯示進度條")
     parser.add_argument("--no-dual", action="store_true", help="關閉簡繁雙寫（回到單字形寫入）")
+    parser.add_argument("--no-vector", action="store_true",
+                        help="關閉密集向量（不連線 Ollama、不寫入 embeddings，保持純文字模式）")
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434",
+                        help="Ollama 服務位址")
+    parser.add_argument("--embedding-model", default="bge-m3:latest",
+                        help="Ollama 向量模型（需先 ollama pull）")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
     cfg = SparkConfig(
         mode=args.mode, db_path=args.db, chroma_dir=args.chroma_dir,
-        dual_script=not args.no_dual,
+        dual_script=not args.no_dual, no_vector=args.no_vector,
+        embedding_base_url=args.ollama_url, embedding_model=args.embedding_model,
     )
     with SparkProcessor(cfg) as sp:
         result = sp.run_pipeline(

@@ -9,6 +9,9 @@ chromadb>=1.0
 opencc-python-reimplemented>=0.1.7
 # Muse Spark 1.3 API 模式才需要（規則模式不需要）
 requests>=2.31
+# RRF 混合檢索：密集向量改走本機 Ollama bge-m3（HTTP，1024 維）；
+# 不載入 torch / sentence-transformers，只需 requests（見下方）＋先啟動 Ollama 並 pull 好模型
+# （Ollama 缺席時自動降級純文字模式，管線不中斷）
 # Web API 服務：FastAPI 後端＋ uvicorn 伺服器（前端為單檔 HTML，無需建置）
 fastapi>=0.110
 uvicorn>=0.29
