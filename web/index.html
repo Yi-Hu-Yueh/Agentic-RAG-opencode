@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<!-- Agentic RAG 對話前端（web/index.html）
+     單檔網頁：Tailwind CDN＋原生 JS，無需建置步驟，直接由 FastAPI 首頁掛載。
+     功能：對話歷史框、輸入欄與送出鈕；每則回答附「推理軌跡」手風琴面板，
+     完整展開 Agent Router 的拆解→路由→反思→重試過程。 -->
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <!-- 【響應式】手機與桌面皆可正常使用 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>無向量 Agentic RAG 問答</title>
+  <!-- 【樣式】Tailwind CDN 即引即用，不需本機建置 -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* 【細節】對話框捲動平滑、程式碼式引用微調 */
+    #chat-box { scroll-behavior: smooth; }
+    .answer-text { white-space: pre-wrap; word-break: break-word; }
+    /* 【手風琴】用 max-height 過渡做展開動畫，JS 切換 .open 類別 */
+    .trace-body { max-height: 0; overflow: hidden; transition: max-height .25s ease; }
+    .trace-body.open { max-height: 1200px; overflow-y: auto; }
+    .trace-arrow { transition: transform .2s ease; }
+    .trace-arrow.open { transform: rotate(90deg); }
+  </style>
+</head>
+<body class="bg-slate-100 min-h-screen flex flex-col">
+  <!-- ===== 頂欄：標題＋知識庫狀態燈 ===== -->
+  <header class="bg-slate-900 text-white px-4 py-3 flex items-center gap-3 shadow">
+    <div class="text-lg font-bold">無向量 Agentic RAG 問答</div>
+    <div class="text-xs text-slate-300">Planner → Router → Critic 重試・簡繁雙寫索引</div>
+    <!-- 【狀態列】JS 載入後打 /api/health 填入筆數；空庫亮紅燈提醒先建庫 -->
+    <div id="health" class="ml-auto text-xs text-slate-300">知識庫載入中…</div>
+  </header>
+
+  <!-- ===== 對話歷史框 ===== -->
+  <main class="flex-1 max-w-3xl w-full mx-auto p-4 flex flex-col gap-4">
+    <div id="chat-box" class="flex flex-col gap-4 min-h-[50vh]"></div>
+
+    <!-- ===== 輸入列：輸入欄＋送出鈕（Enter 也可送出） ===== -->
+    <div class="flex gap-2 sticky bottom-4">
+      <input id="input" type="text" placeholder="輸入問題，例如：數學是什麼？（Enter 送出）"
+             class="flex-1 rounded-lg border border-slate-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500" />
+      <button id="send" class="bg-slate-900 text-white rounded-lg px-5 py-2 hover:bg-slate-700 disabled:opacity-50">
+        送出
+      </button>
+    </div>
+    <div id="error" class="text-red-600 text-sm hidden"></div>
+  </main>
+
+<script>
+/* ===== 工具：HTML 跳脫（維基內文直接 innerHTML 會有 XSS 風險，一律先跳脫） ===== */
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+/* ===== 工具：路由徽章顏色（五路由＋降級一目了然） ===== */
+function routeBadge(route) {
+  const map = {
+    title_lookup:   ["條目直查", "bg-purple-100 text-purple-800"],
+    entity_lookup:  ["實體精查", "bg-blue-100 text-blue-800"],
+    keyword_search: ["關鍵字",   "bg-green-100 text-green-800"],
+    relation_query: ["關係圖譜", "bg-amber-100 text-amber-800"],
+    direct_answer:  ["直接回答", "bg-slate-200 text-slate-700"],
+  };
+  const [label, cls] = map[route] || [route, "bg-slate-200 text-slate-700"];
+  return `<span class="text-xs px-2 py-0.5 rounded-full ${cls}">${esc(label)}</span>`;
+}
+
+/* ===== 健康檢查：載入知識庫筆數，空庫顯示紅色警告 ===== */
+async function loadHealth() {
+  try {
+    const r = await fetch("/api/health");
+    const h = await r.json();
+    const el = document.getElementById("health");
+    if (h.chunks > 0) {
+      el.innerHTML = `<span class="text-green-400">●</span> Chunks ${h.chunks}｜實體 ${h.entities}｜關係 ${h.relations}`;
+    } else {
+      el.innerHTML = `<span class="text-red-400">●</span> 知識庫為空，請先執行 <code>python main.py --batches 10</code> 建庫`;
+    }
+  } catch {
+    document.getElementById("health").textContent = "後端未連線";
+  }
+}
+
+/* ===== 訊息氣泡：user 靠右、assistant 靠左卡片 ===== */
+function addUserMsg(text) {
+  const box = document.getElementById("chat-box");
+  box.insertAdjacentHTML("beforeend",
+    `<div class="self-end max-w-[85%] bg-slate-900 text-white rounded-2xl rounded-br-sm px-4 py-2">${esc(text)}</div>`);
+  box.scrollTop = box.scrollHeight;
+}
+
+/* ===== 推理軌跡手風琴：子問題→反思→命中來源，全部來自後端回傳 ===== */
+function traceHtml(data) {
+  // 【子問題】每步顯示文字、路由徽章、類型、關鍵字
+  const subs = (data.sub_questions || []).map((s, i) =>
+    `<div class="border-l-2 border-slate-300 pl-2 py-1">
+       <div class="text-sm font-medium">步驟 ${i + 1}：${esc(s.text)} ${routeBadge(s.route)}</div>
+       <div class="text-xs text-slate-500">類型 ${esc(s.kind)}｜關鍵字 ${(s.keywords || []).map(esc).join("、") || "（無）"}</div>
+     </div>`).join("");
+  // 【反思】每步顯示通過燈、覆蓋分數、重試次數、評語
+  const refs = (data.reflections || []).map(r =>
+    `<div class="text-sm py-1">
+       ${r.passed ? '<span class="text-green-600">✅</span>' : '<span class="text-red-600">❌</span>'}
+       ${esc(r.sub)} — 分數 ${r.score}・重試 ${r.attempts} 次
+       <div class="text-xs text-slate-500">${esc(r.comment)}</div>
+     </div>`).join("");
+  // 【命中來源】每筆顯示檢索路徑（可辨識 *-fallback 降級）、標題與預覽
+  const ctxs = (data.contexts || []).map(c =>
+    `<div class="text-xs py-1 border-t border-slate-100">
+       <code class="bg-slate-100 px-1 rounded">${esc(c.source)}</code>
+       ${esc(c.title)}・${esc(c.chunk_id)}
+       <div class="text-slate-600">${esc(c.preview)}…</div>
+     </div>`).join("");
+  const ov = data.overall || {};
+  return `
+    <div class="mt-2 border rounded-lg bg-slate-50">
+      <button class="trace-toggle w-full text-left text-sm px-3 py-2 flex items-center gap-2 hover:bg-slate-100">
+        <span class="trace-arrow text-slate-500">▶</span>
+        <span>🔍 Agentic 推理軌跡（${data.sub_questions?.length || 0} 步・累計 ${data.total_attempts || 0} 次檢索・整體 ${ov.passed ? "通過 ✅" : "未通過 ❌"} ${ov.score ?? ""}）</span>
+      </button>
+      <div class="trace-body px-3">
+        <div class="py-1 text-xs font-bold text-slate-500">一、任務拆解</div>${subs || '<div class="text-xs">（無）</div>'}
+        <div class="py-1 text-xs font-bold text-slate-500">二、自我反思</div>${refs || '<div class="text-xs">（無）</div>'}
+        <div class="py-1 text-xs font-bold text-slate-500">三、命中來源</div>${ctxs || '<div class="text-xs">（無命中）</div>'}
+      </div>
+    </div>`;
+}
+
+/* ===== 回答卡片：答案＋軌跡手風琴 ===== */
+function addAssistantMsg(data) {
+  const box = document.getElementById("chat-box");
+  box.insertAdjacentHTML("beforeend",
+    `<div class="self-start max-w-[95%] bg-white rounded-2xl rounded-bl-sm px-4 py-3 shadow">
+       <div class="answer-text text-sm">${esc(data.answer)}</div>
+       ${traceHtml(data)}
+     </div>`);
+  // 【綁定】新插入的手風琴按鈕切換展開／收合
+  const card = box.lastElementChild;
+  card.querySelector(".trace-toggle").addEventListener("click", (ev) => {
+    card.querySelector(".trace-body").classList.toggle("open");
+    card.querySelector(".trace-arrow").classList.toggle("open");
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
+/* ===== 送出流程：鎖按鈕→打 API→渲染→解鎖，錯誤顯示紅字 ===== */
+async function send() {
+  const input = document.getElementById("input");
+  const btn = document.getElementById("send");
+  const err = document.getElementById("error");
+  const q = input.value.trim();
+  if (!q) return;  // 空輸入不送出
+  err.classList.add("hidden");
+  input.value = "";
+  btn.disabled = true;
+  btn.textContent = "思考中…";
+  addUserMsg(q);
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({question: q}),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}：${await r.text()}`);
+    addAssistantMsg(await r.json());
+  } catch (e) {
+    err.textContent = "問答失敗：" + e.message;
+    err.classList.remove("hidden");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "送出";
+    input.focus();
+  }
+}
+
+/* ===== 事件綁定：按鈕點擊＋Enter 送出，載入即查健康狀態 ===== */
+document.getElementById("send").addEventListener("click", send);
+document.getElementById("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") send();
+});
+loadHealth();
+</script>
+</body>
+</html>

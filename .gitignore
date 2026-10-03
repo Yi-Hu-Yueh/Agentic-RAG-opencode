@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.pyc
+# 大容量語料與索引（2GB JSON、SQLite、Chroma 持久化）：不進版控
+data/*.json
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/chroma/

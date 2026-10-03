@@ -1,0 +1,16 @@
+# 核心依賴（loader 本體僅需標準函式庫即可運作）
+# 流式解析 JSON 陣列格式時才需要
+ijson>=3.2
+# 進度條（show_progress=True 時使用，可選）
+tqdm>=4.66
+# 結構化儲存：ChromaDB 僅作 Metadata/文字索引（不啟用向量 Embedding）
+chromadb>=1.0
+# 簡繁雙寫索引：儲存端自動產生對偶字形（缺裝時自動降級單寫，不中斷管線）
+opencc-python-reimplemented>=0.1.7
+# Muse Spark 1.3 API 模式才需要（規則模式不需要）
+requests>=2.31
+# Web API 服務：FastAPI 後端＋ uvicorn 伺服器（前端為單檔 HTML，無需建置）
+fastapi>=0.110
+uvicorn>=0.29
+# 測試
+pytest>=8.0
